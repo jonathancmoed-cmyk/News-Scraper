@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project outputs and caches
+output/
+cache/
+*.xlsx
+
+# Streamlit local config
+.streamlit/
