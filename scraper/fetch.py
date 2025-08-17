@@ -88,48 +88,79 @@ def _is_in_cooldown(host: str) -> bool:
 def _set_cooldown(host: str, seconds: float):
     _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache
-CACHE_DB = CACHE_DIR / "url_cache.sqlite"
+# sqlite cache (thread-safe + auto-heal)
+import threading, sqlite3  # add threading
 
-# hold a global connection (can be re-created if needed)
+CACHE_DB = CACHE_DIR / "url_cache.sqlite"
 _conn = None
+_conn_lock = threading.Lock()
+
+def _reset_conn():
+    global _conn
+    _conn = None
 
 def _get_conn():
-    """Get a valid SQLite connection, reopen if broken."""
+    """Get a valid SQLite connection, reopen if broken (thread-safe)."""
     global _conn
-    import sqlite3
+    with _conn_lock:
+        if _conn is None:
+            _conn = sqlite3.connect(
+                str(CACHE_DB),            # str() helps across envs
+                check_same_thread=False,  # allow Streamlit reruns/threads
+                timeout=30                # wait if db is briefly locked
+            )
+            _conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
+            _conn.execute("PRAGMA synchronous=NORMAL;")
+            _conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+              url TEXT PRIMARY KEY,
+              fetched_at REAL,
+              status INTEGER,
+              content BLOB,
+              headers TEXT
+            )""")
+            _conn.commit()
+            return _conn
+        try:
+            _conn.execute("SELECT 1")
+            return _conn
+        except sqlite3.Error:
+            _conn = None
+            return _get_conn()
 
-    if _conn is None:
-        _conn = sqlite3.connect(
-            CACHE_DB,
-            check_same_thread=False,   # allow Streamlit reruns
-            timeout=30                 # wait if locked
-        )
-        _conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
-        _conn.execute("PRAGMA synchronous=NORMAL;")
-        _conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-          url TEXT PRIMARY KEY,
-          fetched_at REAL,
-          status INTEGER,
-          content BLOB,
-          headers TEXT
-        )""")
-        _conn.commit()
-        return _conn
-
+def _db_select_one(query: str, params: tuple):
+    """SELECT one row with auto-retry if the connection hiccups."""
     try:
-        _conn.execute("SELECT 1")  # test if still alive
-    except Exception:
-        _conn = None
-        return _get_conn()
-    return _conn
+        cur = _get_conn().execute(query, params)
+        return cur.fetchone()
+    except sqlite3.Error:
+        _reset_conn()
+        try:
+            cur = _get_conn().execute(query, params)
+            return cur.fetchone()
+        except sqlite3.Error:
+            return None
+
+def _db_execute(query: str, params: tuple):
+    """Execute write with auto-retry; swallow failure to keep scraper running."""
+    try:
+        _get_conn().execute(query, params)
+        _get_conn().commit()
+    except sqlite3.Error:
+        _reset_conn()
+        try:
+            _get_conn().execute(query, params)
+            _get_conn().commit()
+        except sqlite3.Error:
+            pass
 
 
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
     host = urlparse(url).netloc
     # check cache
-    cur = _get_conn().execute("SELECT fetched_at, status, content, headers FROM cache WHERE url=?", (url,))
-    row = cur.fetchone()
+    row = _db_select_one(
+        "SELECT fetched_at, status, content, headers FROM cache WHERE url=?",
+        (url,),
+    )
     now = time.time()
     if row and (now - row[0] < max_age_seconds):
         class Resp: pass
@@ -155,8 +186,15 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
     try:
         resp = sess.get(url, timeout=timeout, headers=merged_headers)
     except requests.RequestException:
-        if host=="rsshub.app": _set_cooldown(host,180)
-        return None, False
+        if host == "rsshub.app":
+            _set_cooldown(host, 180)
+        # return last cached content if we have it; else an empty stub
+        class Resp: pass
+        r = Resp()
+        r.status_code = 503
+        r.content = row[2] if row else b""
+        r.headers = json.loads(row[3]) if row else {}
+        return r, bool(row)
     _update_last_hit(host)
     # 429 handling
     if getattr(resp,"status_code",0)==429:
@@ -173,11 +211,14 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         _update_last_hit(host)
     if resp.status_code in (500,502,503,504) and host=="rsshub.app":
         _set_cooldown(host,180)
-    _get_conn().execute(
-        "REPLACE INTO cache(url,fetched_at,status,content,headers) VALUES (?,?,?,?,?)",
-        (url, now, resp.status_code, resp.content, json.dumps(dict(resp.headers)))
+    _db_execute(
+        "REPLACE INTO cache(url, fetched_at, status, content, headers) VALUES (?, ?, ?, ?, ?)",
+        (url, now,
+         getattr(resp, "status_code", 0),
+         getattr(resp, "content", b""),
+         json.dumps(dict(getattr(resp, "headers", {})))),
     )
-    _get_conn().commit()
+
     return resp, False
 
 # ========== FEED + PAGE HELPERS ==========
