@@ -4,3 +4,4 @@ pyyaml
 requests
 python-dateutil
 openpyxl
+feedparser
