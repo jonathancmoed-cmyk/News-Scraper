@@ -90,20 +90,45 @@ def _set_cooldown(host: str, seconds: float):
 
 # sqlite cache
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
-_conn = sqlite3.connect(CACHE_DB)
-_conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-  url TEXT PRIMARY KEY,
-  fetched_at REAL,
-  status INTEGER,
-  content BLOB,
-  headers TEXT
-)""")
-_conn.commit()
+
+# hold a global connection (can be re-created if needed)
+_conn = None
+
+def _get_conn():
+    """Get a valid SQLite connection, reopen if broken."""
+    global _conn
+    import sqlite3
+
+    if _conn is None:
+        _conn = sqlite3.connect(
+            CACHE_DB,
+            check_same_thread=False,   # allow Streamlit reruns
+            timeout=30                 # wait if locked
+        )
+        _conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
+        _conn.execute("PRAGMA synchronous=NORMAL;")
+        _conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+          url TEXT PRIMARY KEY,
+          fetched_at REAL,
+          status INTEGER,
+          content BLOB,
+          headers TEXT
+        )""")
+        _conn.commit()
+        return _conn
+
+    try:
+        _conn.execute("SELECT 1")  # test if still alive
+    except Exception:
+        _conn = None
+        return _get_conn()
+    return _conn
+
 
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
     host = urlparse(url).netloc
     # check cache
-    cur = _conn.execute("SELECT fetched_at, status, content, headers FROM cache WHERE url=?", (url,))
+    cur = _get_conn().execute("SELECT fetched_at, status, content, headers FROM cache WHERE url=?", (url,))
     row = cur.fetchone()
     now = time.time()
     if row and (now - row[0] < max_age_seconds):
@@ -148,11 +173,11 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         _update_last_hit(host)
     if resp.status_code in (500,502,503,504) and host=="rsshub.app":
         _set_cooldown(host,180)
-    _conn.execute(
+    _get_conn().execute(
         "REPLACE INTO cache(url,fetched_at,status,content,headers) VALUES (?,?,?,?,?)",
         (url, now, resp.status_code, resp.content, json.dumps(dict(resp.headers)))
     )
-    _conn.commit()
+    _get_conn().commit()
     return resp, False
 
 # ========== FEED + PAGE HELPERS ==========
