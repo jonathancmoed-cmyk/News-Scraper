@@ -88,44 +88,50 @@ def _is_in_cooldown(host: str) -> bool:
 def _set_cooldown(host: str, seconds: float):
     _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache (thread-safe + auto-heal)
-import threading, sqlite3  # add threading
+# sqlite cache (per-thread connections + auto-heal)
+import threading, sqlite3
 
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
-_conn = None
-_conn_lock = threading.Lock()
 
-def _reset_conn():
-    global _conn
-    _conn = None
+# one connection per thread to avoid cross-thread usage errors
+_thread_local = threading.local()
 
 def _get_conn():
-    """Get a valid SQLite connection, reopen if broken (thread-safe)."""
-    global _conn
-    with _conn_lock:
-        if _conn is None:
-            _conn = sqlite3.connect(
-                str(CACHE_DB),            # str() helps across envs
-                check_same_thread=False,  # allow Streamlit reruns/threads
-                timeout=30                # wait if db is briefly locked
-            )
-            _conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
-            _conn.execute("PRAGMA synchronous=NORMAL;")
-            _conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-              url TEXT PRIMARY KEY,
-              fetched_at REAL,
-              status INTEGER,
-              content BLOB,
-              headers TEXT
-            )""")
-            _conn.commit()
-            return _conn
+    """
+    Return a thread-local SQLite connection.
+    Each Streamlit runner thread gets its own connection, avoiding cross-thread use.
+    """
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(
+            str(CACHE_DB),
+            check_same_thread=True,  # safe because each thread has its own connection
+            timeout=30,
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+          url TEXT PRIMARY KEY,
+          fetched_at REAL,
+          status INTEGER,
+          content BLOB,
+          headers TEXT
+        )""")
+        conn.commit()
+        _thread_local.conn = conn
+        return conn
+    # health check
+    try:
+        conn.execute("SELECT 1")
+        return conn
+    except sqlite3.Error:
+        # reopen if the existing one went bad
         try:
-            _conn.execute("SELECT 1")
-            return _conn
-        except sqlite3.Error:
-            _conn = None
-            return _get_conn()
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
+        return _get_conn()
 
 def _db_select_one(query: str, params: tuple):
     """SELECT one row with auto-retry if the connection hiccups."""
@@ -133,7 +139,8 @@ def _db_select_one(query: str, params: tuple):
         cur = _get_conn().execute(query, params)
         return cur.fetchone()
     except sqlite3.Error:
-        _reset_conn()
+        # reopen and retry once
+        _thread_local.conn = None
         try:
             cur = _get_conn().execute(query, params)
             return cur.fetchone()
@@ -146,7 +153,7 @@ def _db_execute(query: str, params: tuple):
         _get_conn().execute(query, params)
         _get_conn().commit()
     except sqlite3.Error:
-        _reset_conn()
+        _thread_local.conn = None
         try:
             _get_conn().execute(query, params)
             _get_conn().commit()
@@ -161,6 +168,7 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         "SELECT fetched_at, status, content, headers FROM cache WHERE url=?",
         (url,),
     )
+    
     now = time.time()
     if row and (now - row[0] < max_age_seconds):
         class Resp: pass
