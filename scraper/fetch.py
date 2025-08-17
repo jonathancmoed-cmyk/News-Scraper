@@ -295,38 +295,97 @@ def fetch_headlines(
     debug_article=False,
     debug_date_sources=True,
 ):
-    now_utc=datetime.now(timezone.utc)
-    cutoff=now_utc-timedelta(minutes=minutes_back)
-    rows=[]
+    # normalize filters once
+    include_kw = [k.strip().lower() for k in (include_kw or []) if isinstance(k, str) and k.strip()]
+    exclude_kw = [k.strip().lower() for k in (exclude_kw or []) if isinstance(k, str) and k.strip()]
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(minutes=minutes_back)
+    rows = []
+
     for feed in feeds:
-        url=feed.get("url")
-        if not url: continue
+        url = feed.get("url")
+        if not url:
+            continue
+
+        # Expand {when} for Google News feeds
         if "{when}" in url:
-            url=url.replace("{when}",google_news_when(minutes_back))
-        parsed=parse_feed_with_cache(url)
-        entries=getattr(parsed,"entries",[]) or []
-        fallback_tz=_feed_fallback_tz(feed)
+            url = url.replace("{when}", google_news_when(minutes_back))
+
+        parsed = parse_feed_with_cache(url)
+        entries = getattr(parsed, "entries", []) or []
+        fallback_tz = _feed_fallback_tz(feed)
+        source_name = feed.get("name") or "unknown"
+        source_type = feed.get("source_type") or "rss"
+
         for e in entries:
-            title=(e.get("title") or "").strip()
-            if not title: continue
-            summary=pick_summary(e)
-            link=unwrap_google_news(e.get("link") or "")
-            published_dt,ts_source=parse_from_feed_fields(e,fallback_tz)
+            title = (e.get("title") or "").strip()
+            if not title:
+                continue
+            summary = pick_summary(e)
+            link = unwrap_google_news(e.get("link") or "")
+
+            # ---------- APPLY KEYWORD FILTERS ----------
+            blob = f"{title} {summary}".lower()
+            if include_kw and not any(k in blob for k in include_kw):
+                continue  # must match at least one include term
+            if exclude_kw and any(k in blob for k in exclude_kw):
+                continue  # drop if any exclude term matches
+            # ------------------------------------------
+
+            # 1) feed-provided publish time
+            published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
+
+            # 2) fallback to page metadata if needed
+            fetch_status = "ok"
             if published_dt is None and link:
-                published_dt,ts_source,_=fetch_page_published_time(link,fallback_tz)
-            if published_dt is None: 
-                published_dt=now_utc; ts_source="fallback_now"
-            if published_dt<cutoff: continue
+                published_dt, ts_source, fetch_status = fetch_page_published_time(link, fallback_tz)
+
+            # 3) final fallback so it still appears
+            if published_dt is None:
+                published_dt = now_utc
+                ts_source = "fallback_now"
+                if fetch_status is None:
+                    fetch_status = "no_date_anywhere"
+
+            if published_dt < cutoff:
+                continue
+
             rows.append({
-                "headline":title,"summary":summary,"source":feed.get("name"),
-                "link":link,"source_type":"rss","published":published_dt.isoformat(),
-                "timestamp":now_utc.isoformat(),"event_type":"",
-                "timestamp_source":ts_source,"page_fetch_status":"ok",
+                "headline": title,
+                "summary": summary,
+                "source": source_name,
+                "link": link,
+                "source_type": source_type,
+                "published": published_dt.isoformat(),
+                "timestamp": now_utc.isoformat(),
+                "event_type": "",
+                "timestamp_source": ts_source,
+                "page_fetch_status": fetch_status or "ok",
             })
-    df=pd.DataFrame(rows)
-    if df.empty: return df
-    df=df.drop_duplicates(subset=["headline","link"]).reset_index(drop=True)
-    df=df.sort_values(by="published",ascending=False).reset_index(drop=True)
+
+    df = pd.DataFrame(rows, columns=[
+        "headline","summary","source","link","source_type",
+        "published","timestamp","event_type","timestamp_source","page_fetch_status"
+    ])
+
+    if df.empty:
+        return df
+
+    # De-dup + newest-first
+    def _to_dt_or_min(x):
+        try:
+            return dtparser.parse(x) if x else datetime(1970,1,1, tzinfo=timezone.utc)
+        except Exception:
+            return datetime(1970,1,1, tzinfo=timezone.utc)
+
+    df = df.drop_duplicates(subset=["headline","link"]).reset_index(drop=True)
+    df["_sort_pub"] = df["published"].apply(_to_dt_or_min)
+    df["_sort_ts"] = df["timestamp"].apply(_to_dt_or_min)
+    df = df.sort_values(by=["_sort_pub","_sort_ts"], ascending=False)\
+           .drop(columns=["_sort_pub","_sort_ts"])\
+           .reset_index(drop=True)
+
     return df
 
 # ========== LOCALIZE + EXCEL ==========
