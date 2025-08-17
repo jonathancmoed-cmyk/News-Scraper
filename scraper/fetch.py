@@ -88,27 +88,30 @@ def _is_in_cooldown(host: str) -> bool:
 def _set_cooldown(host: str, seconds: float):
     _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache (per-thread connections + auto-heal)
+# sqlite cache (per-thread connections, cross-thread safe, auto-heal)
 import threading, sqlite3
 
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
 
-# one connection per thread to avoid cross-thread usage errors
+# one connection per thread
 _thread_local = threading.local()
 
 def _get_conn():
     """
     Return a thread-local SQLite connection.
-    Each Streamlit runner thread gets its own connection, avoiding cross-thread use.
+    - per-thread connection prevents cross-thread reuse bugs
+    - check_same_thread=False tolerates any Streamlit runner shenanigans
+    - isolation_level=None -> autocommit to reduce 'database is locked'
     """
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
         conn = sqlite3.connect(
             str(CACHE_DB),
-            check_same_thread=True,  # safe because each thread has its own connection
+            check_same_thread=False,   # IMPORTANT: tolerate thread switches
             timeout=30,
+            isolation_level=None,      # autocommit (less locking)
         )
-        conn.execute("PRAGMA journal_mode=WAL;")    # better concurrency
+        conn.execute("PRAGMA journal_mode=WAL;")      # better concurrent access
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("""CREATE TABLE IF NOT EXISTS cache (
           url TEXT PRIMARY KEY,
@@ -117,15 +120,14 @@ def _get_conn():
           content BLOB,
           headers TEXT
         )""")
-        conn.commit()
         _thread_local.conn = conn
         return conn
-    # health check
+
+    # health check; reopen if broken
     try:
         conn.execute("SELECT 1")
         return conn
     except sqlite3.Error:
-        # reopen if the existing one went bad
         try:
             conn.close()
         except Exception:
@@ -139,7 +141,6 @@ def _db_select_one(query: str, params: tuple):
         cur = _get_conn().execute(query, params)
         return cur.fetchone()
     except sqlite3.Error:
-        # reopen and retry once
         _thread_local.conn = None
         try:
             cur = _get_conn().execute(query, params)
@@ -151,15 +152,13 @@ def _db_execute(query: str, params: tuple):
     """Execute write with auto-retry; swallow failure to keep scraper running."""
     try:
         _get_conn().execute(query, params)
-        _get_conn().commit()
+        # autocommit on (isolation_level=None), so no explicit commit
     except sqlite3.Error:
         _thread_local.conn = None
         try:
             _get_conn().execute(query, params)
-            _get_conn().commit()
         except sqlite3.Error:
             pass
-
 
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
     host = urlparse(url).netloc
