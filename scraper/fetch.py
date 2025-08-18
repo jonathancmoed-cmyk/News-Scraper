@@ -2,6 +2,7 @@ import os, json, sqlite3, time, re, random
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
 from datetime import datetime, timedelta, timezone
+import threading 
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -93,28 +94,54 @@ import sqlite3
 
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
 
-def _conn_new():
-    # autocommit, cross-thread OK
-    conn = sqlite3.connect(
-        str(CACHE_DB),
-        check_same_thread=False,
-        timeout=30,
-        isolation_level=None,   # autocommit
-    )
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-      url TEXT PRIMARY KEY,
-      fetched_at REAL,
-      status INTEGER,
-      content BLOB,
-      headers TEXT
-    )""")
-    return conn
+# ---- Thread-safe, once-only DB initializer + per-call DB helpers ----
+INIT_LOCK = threading.RLock()
+_DB_INIT_DONE = False
+
+def _init_cache_db_once():
+    """
+    Ensure the cache database exists and has the correct schema.
+    Done once per process; guarded with a lock to avoid cross-thread init races.
+    """
+    global _DB_INIT_DONE
+    if _DB_INIT_DONE:
+        return
+    with INIT_LOCK:
+        if _DB_INIT_DONE:
+            return
+        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
+        conn = sqlite3.connect(
+            db_uri,
+            uri=True,
+            check_same_thread=False,  # allow handle to be used across threads if needed
+            timeout=30,
+            isolation_level=None,     # autocommit
+        )
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("""CREATE TABLE IF NOT EXISTS cache (
+              url TEXT PRIMARY KEY,
+              fetched_at REAL,
+              status INTEGER,
+              content BLOB,
+              headers TEXT
+            )""")
+        finally:
+            conn.close()
+        _DB_INIT_DONE = True
 
 def _db_select_one(query: str, params: tuple):
+    _init_cache_db_once()
     try:
-        conn = _conn_new()
+        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
+        conn = sqlite3.connect(
+            db_uri,
+            uri=True,
+            check_same_thread=False,
+            timeout=30,
+            isolation_level=None,
+        )
         try:
             cur = conn.execute(query, params)
             return cur.fetchone()
@@ -124,11 +151,18 @@ def _db_select_one(query: str, params: tuple):
         return None
 
 def _db_execute(query: str, params: tuple):
+    _init_cache_db_once()
     try:
-        conn = _conn_new()
+        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
+        conn = sqlite3.connect(
+            db_uri,
+            uri=True,
+            check_same_thread=False,
+            timeout=30,
+            isolation_level=None,
+        )
         try:
             conn.execute(query, params)
-            # autocommit active; no explicit commit
         finally:
             conn.close()
     except sqlite3.Error:
