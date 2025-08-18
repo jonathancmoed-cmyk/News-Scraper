@@ -1,10 +1,8 @@
-import os, json, sqlite3, time, re, random
+import os, json, time, re, random, base64, tempfile, shutil
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
 from datetime import datetime, timedelta, timezone
 import threading
-import tempfile
-import shutil
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -96,160 +94,152 @@ def _set_cooldown(host: str, seconds: float):
     with _NET_LOCK:
         _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache (per-call open/close; thread-safe)
-CACHE_DB = CACHE_DIR / "url_cache.sqlite"
+# ========== FILE-BASED HTTP CACHE (JSON) ==========
+HTTP_CACHE_FILE = CACHE_DIR / "url_cache.json"
+_HTTP_CACHE_LOCK = threading.RLock()
+_HTTP_CACHE: dict[str, dict] = {}  # in-memory map: url -> record
 
-# ---- Thread-safe, once-only DB initializer + per-call DB helpers ----
-INIT_LOCK = threading.RLock()
-_DB_INIT_DONE = False
-
-def _init_cache_db_once():
-    """
-    Ensure the cache database exists and has the correct schema.
-    Done once per process; guarded with a lock to avoid cross-thread init races.
-    """
-    global _DB_INIT_DONE
-    if _DB_INIT_DONE:
-        return
-    with INIT_LOCK:
-        if _DB_INIT_DONE:
-            return
-        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
-        conn = sqlite3.connect(
-            db_uri,
-            uri=True,
-            check_same_thread=True,
-            timeout=30,
-            isolation_level=None,     # autocommit
-        )
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("""CREATE TABLE IF NOT EXISTS cache (
-              url TEXT PRIMARY KEY,
-              fetched_at REAL,
-              status INTEGER,
-              content BLOB,
-              headers TEXT
-            )""")
-        finally:
-            conn.close()
-        _DB_INIT_DONE = True
-
-def _db_select_one(query: str, params: tuple):
-    _init_cache_db_once()
+def _atomic_save_json(path: Path, data: dict):
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    os.close(tmp_fd)
     try:
-        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
-        conn = sqlite3.connect(
-            db_uri,
-            uri=True,
-            check_same_thread=True,
-            timeout=30,
-            isolation_level=None,
-        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        shutil.move(tmp_path, path)
+    finally:
         try:
-            cur = conn.execute(query, params)
-            return cur.fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return None
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
-def _db_execute(query: str, params: tuple):
-    _init_cache_db_once()
-    try:
-        db_uri = f"file:{CACHE_DB}?mode=rwc&cache=shared"
-        conn = sqlite3.connect(
-            db_uri,
-            uri=True,
-            check_same_thread=True,
-            timeout=30,
-            isolation_level=None,
-        )
+def _load_http_cache(path: Path) -> dict:
+    if path.exists():
         try:
-            conn.execute(query, params)
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        # swallow write errors; scraper still functions
-        pass
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
+def _save_http_cache():
+    with _HTTP_CACHE_LOCK:
+        _atomic_save_json(HTTP_CACHE_FILE, _HTTP_CACHE)
+
+def _get_cached_record(url: str):
+    with _HTTP_CACHE_LOCK:
+        return _HTTP_CACHE.get(url)
+
+def _set_cached_record(url: str, status: int, content_bytes: bytes, headers: dict):
+    rec = {
+        "fetched_at": time.time(),
+        "status": int(status or 0),
+        "content_b64": base64.b64encode(content_bytes or b"").decode("ascii"),
+        "headers": dict(headers or {}),
+    }
+    with _HTTP_CACHE_LOCK:
+        _HTTP_CACHE[url] = rec
+        _atomic_save_json(HTTP_CACHE_FILE, _HTTP_CACHE)
+
+# load once at import
+_HTTP_CACHE = _load_http_cache(HTTP_CACHE_FILE)
 
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
+    """
+    Cache layer backed by a JSON file. Thread-safe via locks + atomic writes.
+    """
     host = urlparse(url).netloc
-    # check cache
-    row = _db_select_one(
-        "SELECT fetched_at, status, content, headers FROM cache WHERE url=?",
-        (url,),
-    )
-    
     now = time.time()
-    if row and (now - row[0] < max_age_seconds):
+
+    # check cache
+    rec = _get_cached_record(url)
+    if rec and (now - rec.get("fetched_at", 0)) < max_age_seconds:
         class Resp: pass
         resp = Resp()
-        resp.status_code = row[1]
-        resp.content = row[2]
+        resp.status_code = rec.get("status", 0)
         try:
-            resp.headers = json.loads(row[3])
+            resp.content = base64.b64decode(rec.get("content_b64", "") or "")
         except Exception:
-            resp.headers = {}
+            resp.content = b""
+        resp.headers = rec.get("headers", {}) or {}
         return resp, True
+
     # cooldown
     if _is_in_cooldown(host):
         class Resp: pass
         r = Resp()
         r.status_code = 503
-        r.content = row[2] if row else b""
-        try:
-            r.headers = json.loads(row[3]) if row else {}
-        except Exception:
+        # if stale cache exists, return that content; else empty
+        if rec:
+            try:
+                r.content = base64.b64decode(rec.get("content_b64", "") or "")
+            except Exception:
+                r.content = b""
+            r.headers = rec.get("headers", {}) or {}
+        else:
+            r.content = b""
             r.headers = {}
-        return r, bool(row)
+        return r, bool(rec)
+
     # polite wait
     _polite_wait(host)
+
     # session
     sess = SESSION_RSSHUB if host == "rsshub.app" else SESSION
-    timeout = timeout_override if timeout_override is not None else (8 if host=="rsshub.app" else 15)
+    timeout = timeout_override if timeout_override is not None else (8 if host == "rsshub.app" else 15)
     merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
+
+    # perform request with retry and capture response
     try:
         resp = sess.get(url, timeout=timeout, headers=merged_headers)
     except requests.RequestException:
         if host == "rsshub.app":
             _set_cooldown(host, 180)
-        # return last cached content if we have it; else an empty stub
+        # synthesize a response from stale cache if any
         class Resp: pass
         r = Resp()
         r.status_code = 503
-        r.content = row[2] if row else b""
-        try:
-            r.headers = json.loads(row[3]) if row else {}
-        except Exception:
+        if rec:
+            try:
+                r.content = base64.b64decode(rec.get("content_b64", "") or "")
+            except Exception:
+                r.content = b""
+            r.headers = rec.get("headers", {}) or {}
+        else:
+            r.content = b""
             r.headers = {}
-        return r, bool(row)
+        return r, bool(rec)
+
     _update_last_hit(host)
-    # 429 handling
-    if getattr(resp,"status_code",0)==429:
+
+    # 429 one-shot backoff
+    if getattr(resp, "status_code", 0) == 429:
         ra = resp.headers.get("Retry-After")
-        try: sleep_s = float(ra)
-        except: sleep_s = max(MIN_GAP.get(host,DEFAULT_GAP),3.0)
+        try:
+            sleep_s = float(ra)
+        except Exception:
+            sleep_s = max(MIN_GAP.get(host, DEFAULT_GAP), 3.0)
         time.sleep(sleep_s)
         _polite_wait(host)
         try:
             resp = sess.get(url, timeout=timeout, headers=merged_headers)
         except requests.RequestException:
-            if host=="rsshub.app": _set_cooldown(host,180)
+            if host == "rsshub.app":
+                _set_cooldown(host, 180)
             return None, False
         _update_last_hit(host)
-    if resp.status_code in (500,502,503,504) and host=="rsshub.app":
-        _set_cooldown(host,180)
-    _db_execute(
-        "REPLACE INTO cache(url, fetched_at, status, content, headers) VALUES (?, ?, ?, ?, ?)",
-        (url, now,
-         getattr(resp, "status_code", 0),
-         getattr(resp, "content", b""),
-         json.dumps(dict(getattr(resp, "headers", {})))),
-    )
 
+    # cooldown for flaky hosts
+    if resp.status_code in (500, 502, 503, 504) and host == "rsshub.app":
+        _set_cooldown(host, 180)
+
+    # persist cache
+    _set_cached_record(
+        url,
+        getattr(resp, "status_code", 0),
+        getattr(resp, "content", b""),
+        dict(getattr(resp, "headers", {}))
+    )
     return resp, False
 
 # ========== FEED + PAGE HELPERS ==========
@@ -333,8 +323,7 @@ def _load_cache(path: Path) -> dict:
                 return {}
         return {}
 
-def _atomic_save_json(path: Path, data: dict):
-    # Write to a temp file then replace atomically to avoid truncated/corrupt files
+def _atomic_save_json_pub(path: Path, data: dict):
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
     os.close(tmp_fd)
     try:
@@ -351,7 +340,7 @@ def _atomic_save_json(path: Path, data: dict):
 def _save_cache(path: Path, data: dict):
     with _CACHE_LOCK:
         try:
-            _atomic_save_json(path, data)
+            _atomic_save_json_pub(path, data)
         except Exception:
             pass
 
@@ -369,7 +358,6 @@ def fetch_page_published_time(url: str,fallback_tz):
         try:
             return dtparser.parse(rec["published_utc"]), rec.get("source"), "cached"
         except Exception:
-            # bad cache entry — fall through to refetch
             pass
 
     # throttle hard cap
@@ -379,7 +367,7 @@ def fetch_page_published_time(url: str,fallback_tz):
 
     html, status = _http_get(url)
     with _PAGE_FETCHES_LOCK:
-        _PAGE_FETCHES += 1  # count an attempt regardless of code path
+        _PAGE_FETCHES += 1
 
     if status != "ok" or not html:
         return None, "fetch_failed", status
