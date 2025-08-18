@@ -497,12 +497,24 @@ def fetch_headlines(
 
                 # 1) feed-provided publish time
                 published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
-
-                # 2) fallback to page metadata if needed
+                
+                # 2) also try page "published" time (meta/JSON-LD)
+                page_pub_dt = None
+                page_src = None
+                page_status = None
                 fetch_status = "ok"
-                if published_dt is None and link:
-                    published_dt, ts_source, fetch_status = fetch_page_published_time(link, fallback_tz)
-
+                
+                if link:
+                    page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
+                
+                # Decision: prefer the page "published" time when it exists and is earlier
+                # (CNBC and others put "updated" in feed pubDate; the page has the true original publish)
+                if page_pub_dt:
+                    if (published_dt is None) or (page_pub_dt < published_dt - timedelta(seconds=30)):
+                        published_dt = page_pub_dt
+                        ts_source = page_src or "page_meta"
+                        fetch_status = page_status or "ok"
+                
                 # 3) final fallback so it still appears
                 if published_dt is None:
                     published_dt = now_utc
