@@ -2,7 +2,7 @@ import os, json, sqlite3, time, re, random
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
 from datetime import datetime, timedelta, timezone
-import threading
+import threading 
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -89,7 +89,9 @@ def _is_in_cooldown(host: str) -> bool:
 def _set_cooldown(host: str, seconds: float):
     _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache (per-call open/close; thread-safe)
+# sqlite cache (open-per-call; no shared connection -> thread-safe)
+import sqlite3
+
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
 
 # ---- Thread-safe, once-only DB initializer + per-call DB helpers ----
@@ -182,10 +184,7 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         resp = Resp()
         resp.status_code = row[1]
         resp.content = row[2]
-        try:
-            resp.headers = json.loads(row[3])
-        except Exception:
-            resp.headers = {}
+        resp.headers = json.loads(row[3])
         return resp, True
     # cooldown
     if _is_in_cooldown(host):
@@ -193,10 +192,7 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         r = Resp()
         r.status_code = 503
         r.content = row[2] if row else b""
-        try:
-            r.headers = json.loads(row[3]) if row else {}
-        except Exception:
-            r.headers = {}
+        r.headers = json.loads(row[3]) if row else {}
         return r, bool(row)
     # polite wait
     _polite_wait(host)
@@ -214,10 +210,7 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         r = Resp()
         r.status_code = 503
         r.content = row[2] if row else b""
-        try:
-            r.headers = json.loads(row[3]) if row else {}
-        except Exception:
-            r.headers = {}
+        r.headers = json.loads(row[3]) if row else {}
         return r, bool(row)
     _update_last_hit(host)
     # 429 handling
@@ -292,23 +285,6 @@ def _jsonld_date_published(html: str):
     except: pass
     return None
 
-# Meta <meta property="article:published_time" content="..."> extraction
-_META_TAG_RE = re.compile(
-    r'<meta[^>]+(?:property|name)=["\'](?:article:published_time|og:published_time)["\'][^>]*>',
-    re.I
-)
-_CONTENT_ATTR_RE = re.compile(r'\bcontent=["\']([^"\']+)["\']', re.I)
-
-def _meta_published_from_html(html: str):
-    """
-    Return the value of content=... from an appropriate meta tag, if present.
-    """
-    for tag in _META_TAG_RE.findall(html):
-        m = _CONTENT_ATTR_RE.search(tag)
-        if m:
-            return m.group(1).strip()
-    return None
-
 # pubtime JSON cache
 CACHE_FILE = CACHE_DIR / "url_pubtime_cache.json"
 UTC = dttz.UTC
@@ -329,54 +305,28 @@ _PUBTIME_CACHE = _load_cache(CACHE_FILE)
 
 def fetch_page_published_time(url: str,fallback_tz):
     global _PAGE_FETCHES, _PUBTIME_CACHE
-    if not url:
-        return None, "fetch_failed", "error"
-
-    # JSON cache hit
+    if not url: return None,"fetch_failed","error"
     rec = _PUBTIME_CACHE.get(url)
-    if rec:
-        try:
-            return dtparser.parse(rec["published_utc"]), rec.get("source"), "cached"
-        except Exception:
-            # bad cache entry — fall through to refetch
-            pass
-
-    # throttle hard cap
-    if _PAGE_FETCHES >= 300:
-        return None, "fetch_failed", "no_meta"
-
-    html, status = _http_get(url)
-    _PAGE_FETCHES += 1  # count an attempt regardless of code path
-
-    if status != "ok" or not html:
-        return None, "fetch_failed", status
-
-    # 1) meta tags
-    raw = _meta_published_from_html(html)
+    if rec: return dtparser.parse(rec["published_utc"]),rec.get("source"),"cached"
+    if _PAGE_FETCHES>=300: return None,"fetch_failed","no_meta"
+    html,status=_http_get(url)
+    _PAGE_FETCHES+=1
+    if status!="ok" or not html: return None,"fetch_failed",status
+    # check meta tags
+    for pattern,label in [
+        (r'article:published_time','article:published_time'),
+        (r'og:published_time','og:published_time')
+    ]:
+        m=re.search(pattern,html,re.I)
+        if m:
+            dt=dtparser.parse(m.group(0))
+            return dt.astimezone(UTC),f"page_meta_{label}","ok"
+    # JSON-LD
+    raw=_jsonld_date_published(html)
     if raw:
-        try:
-            dt = dtparser.parse(raw)
-            dt_utc = dt.astimezone(UTC)
-            # Persist to JSON cache
-            _PUBTIME_CACHE[url] = {"published_utc": dt_utc.isoformat(), "source": "page_meta"}
-            _save_cache(CACHE_FILE, _PUBTIME_CACHE)
-            return dt_utc, "page_meta", "ok"
-        except Exception:
-            pass
-
-    # 2) JSON-LD
-    raw = _jsonld_date_published(html)
-    if raw:
-        try:
-            dt = dtparser.parse(raw)
-            dt_utc = dt.astimezone(UTC)
-            _PUBTIME_CACHE[url] = {"published_utc": dt_utc.isoformat(), "source": "json_ld"}
-            _save_cache(CACHE_FILE, _PUBTIME_CACHE)
-            return dt_utc, "json_ld", "ok"
-        except Exception:
-            pass
-
-    return None, "fetch_failed", "no_meta"
+        dt=dtparser.parse(raw)
+        return dt.astimezone(UTC),"json_ld","ok"
+    return None,"fetch_failed","no_meta"
 
 def _feed_fallback_tz(feed_cfg: dict):
     tz_name=feed_cfg.get("tz")
