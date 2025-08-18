@@ -20,13 +20,13 @@ feeds:
     page_time_mode: off    
 
 
-  # ===== Tech =====
+  # ===== Tech ===== [TRUST]
   - name: TechCrunch Top Stories
     url: https://techcrunch.com/feed/
     tz: America/Los_Angeles
     page_time_mode: off  
 
-  # ===== BBC ===== 
+  # ===== BBC ===== [DON'T TRUST]
   - name: BBC Business
     url: https://feeds.bbci.co.uk/news/business/rss.xml
     tz: Europe/London
@@ -41,7 +41,7 @@ feeds:
     page_time_mode: prefer  
 
 
-  # ===== CNBC =====
+  # ===== CNBC ===== [DON'T TRUST - KEEP REVIEWING]
   - name: CNBC Business
     url: https://www.cnbc.com/id/10001147/device/rss/rss.html
     tz: America/New_York
@@ -59,7 +59,7 @@ feeds:
     tz: America/New_York
     page_time_mode: off       
 
-  # ===== NBC =====
+  # ===== NBC ===== [TRUST]
   - name: NBC Top News
     url: https://feeds.nbcnews.com/nbcnews/public/news
     tz: America/New_York
@@ -73,7 +73,7 @@ feeds:
     tz: America/New_York
     page_time_mode: off 
 
-  # ===== Sky News =====
+  # ===== Sky News ===== [TRUST]
   - name: Sky Top Stories
     url: https://feeds.skynews.com/feeds/rss/home.xml
     tz: Europe/London
@@ -87,7 +87,7 @@ feeds:
     tz: Europe/London
     page_time_mode: off 
 
-  # ===== NPR =====
+  # ===== NPR ===== [TRUST]
   - name: NPR Top News
     url: https://feeds.npr.org/1001/rss.xml
     tz: America/New_York
@@ -102,7 +102,7 @@ feeds:
     page_time_mode: off 
 
 
-  # ===== Seeking Alpha (backup) =====
+  # ===== Seeking Alpha (backup) ===== [TRUST]
   - name: Seeking Alpha Market News
     url: https://seekingalpha.com/market-news/earnings.xml
     tz: UTC
