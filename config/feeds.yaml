@@ -24,9 +24,9 @@ feeds:
   - name: TechCrunch Top Stories
     url: https://techcrunch.com/feed/
     tz: America/Los_Angeles
-    page_time_mode: prefer    
+    page_time_mode: off  
 
-  # ===== BBC =====
+  # ===== BBC ===== 
   - name: BBC Business
     url: https://feeds.bbci.co.uk/news/business/rss.xml
     tz: Europe/London
@@ -45,66 +45,66 @@ feeds:
   - name: CNBC Business
     url: https://www.cnbc.com/id/10001147/device/rss/rss.html
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: CNBC Markets
     url: https://www.cnbc.com/id/100003114/device/rss/rss.html
     tz: America/New_York
-    page_time_mode: prefer      # <- fetch page & prefer earlier page "published"
+    page_time_mode: off      # <- fetch page & prefer earlier page "published"
   - name: CNBC Investing
     url: https://www.cnbc.com/id/15839069/device/rss/rss.html
     tz: America/New_York
-    page_time_mode: prefer       
+    page_time_mode: off       
   - name: CNBC Politics
     url: https://www.cnbc.com/id/10000113/device/rss/rss.html
     tz: America/New_York
-    page_time_mode: prefer       
+    page_time_mode: off       
 
   # ===== NBC =====
   - name: NBC Top News
     url: https://feeds.nbcnews.com/nbcnews/public/news
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: NBC Politics
     url: https://feeds.nbcnews.com/nbcnews/public/politics
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: NBC Business
     url: https://feeds.nbcnews.com/nbcnews/public/business
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
 
   # ===== Sky News =====
   - name: Sky Top Stories
     url: https://feeds.skynews.com/feeds/rss/home.xml
     tz: Europe/London
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: Sky Business
     url: https://feeds.skynews.com/feeds/rss/business.xml
     tz: Europe/London
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: Sky World
     url: https://feeds.skynews.com/feeds/rss/world.xml
     tz: Europe/London
-    page_time_mode: prefer 
+    page_time_mode: off 
 
   # ===== NPR =====
   - name: NPR Top News
     url: https://feeds.npr.org/1001/rss.xml
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: NPR Business
     url: https://feeds.npr.org/1006/rss.xml
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
   - name: NPR Politics
     url: https://feeds.npr.org/1014/rss.xml
     tz: America/New_York
-    page_time_mode: prefer 
+    page_time_mode: off 
 
 
   # ===== Seeking Alpha (backup) =====
   - name: Seeking Alpha Market News
     url: https://seekingalpha.com/market-news/earnings.xml
     tz: UTC
-    page_time_mode: prefer 
+    page_time_mode: off 
 
