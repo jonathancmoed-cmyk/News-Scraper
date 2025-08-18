@@ -10,6 +10,14 @@ import streamlit as st
 from scraper.config import load_feeds, CACHE_DIR
 from scraper.fetch import fetch_headlines, localize_df_for_display
 
+# DEBUG: show which fetch module is loaded + confirm backend
+import inspect
+import scraper.fetch as fetch
+
+st.sidebar.caption(f"Loaded fetch module: `{fetch.__file__}`")
+src = inspect.getsource(fetch)
+uses_sqlite = "sqlite3" in src or "url_cache.sqlite" in src
+st.sidebar.caption(f"fetch backend: {'SQLITE' if uses_sqlite else 'JSON'}")
 
 st.set_page_config(page_title="News Scraper", layout="wide")
 st.title("News Scraper")
