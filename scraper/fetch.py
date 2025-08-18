@@ -2,7 +2,9 @@ import os, json, sqlite3, time, re, random
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
 from datetime import datetime, timedelta, timezone
-import threading 
+import threading
+import tempfile
+import shutil
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -67,31 +69,34 @@ def make_light_session() -> requests.Session:
 SESSION = make_session()
 SESSION_RSSHUB = make_light_session()
 
-# polite wait + cooldown
+# polite wait + cooldown (guard with locks)
 _last_hit = {}
 MIN_GAP = {"rsshub.app":5.0,"apnews.com":2.0,"www.theguardian.com":0.6}
 DEFAULT_GAP = 0.8
 _HOST_COOLDOWN_UNTIL = {}
+_NET_LOCK = threading.RLock()
 
 def _polite_wait(host: str):
-    gap = MIN_GAP.get(host, DEFAULT_GAP)
-    last = _last_hit.get(host, 0.0)
+    with _NET_LOCK:
+        gap = MIN_GAP.get(host, DEFAULT_GAP)
+        last = _last_hit.get(host, 0.0)
     wait = (last + gap) - time.time()
     if wait > 0:
         time.sleep(wait)
 
 def _update_last_hit(host: str):
-    _last_hit[host] = time.time()
+    with _NET_LOCK:
+        _last_hit[host] = time.time()
 
 def _is_in_cooldown(host: str) -> bool:
-    return time.time() < _HOST_COOLDOWN_UNTIL.get(host, 0)
+    with _NET_LOCK:
+        return time.time() < _HOST_COOLDOWN_UNTIL.get(host, 0)
 
 def _set_cooldown(host: str, seconds: float):
-    _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
+    with _NET_LOCK:
+        _HOST_COOLDOWN_UNTIL[host] = time.time() + seconds
 
-# sqlite cache (open-per-call; no shared connection -> thread-safe)
-import sqlite3
-
+# sqlite cache (per-call open/close; thread-safe)
 CACHE_DB = CACHE_DIR / "url_cache.sqlite"
 
 # ---- Thread-safe, once-only DB initializer + per-call DB helpers ----
@@ -113,7 +118,7 @@ def _init_cache_db_once():
         conn = sqlite3.connect(
             db_uri,
             uri=True,
-            check_same_thread=False,  # allow handle to be used across threads if needed
+            check_same_thread=False,
             timeout=30,
             isolation_level=None,     # autocommit
         )
@@ -184,7 +189,10 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         resp = Resp()
         resp.status_code = row[1]
         resp.content = row[2]
-        resp.headers = json.loads(row[3])
+        try:
+            resp.headers = json.loads(row[3])
+        except Exception:
+            resp.headers = {}
         return resp, True
     # cooldown
     if _is_in_cooldown(host):
@@ -192,7 +200,10 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         r = Resp()
         r.status_code = 503
         r.content = row[2] if row else b""
-        r.headers = json.loads(row[3]) if row else {}
+        try:
+            r.headers = json.loads(row[3]) if row else {}
+        except Exception:
+            r.headers = {}
         return r, bool(row)
     # polite wait
     _polite_wait(host)
@@ -210,7 +221,10 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         r = Resp()
         r.status_code = 503
         r.content = row[2] if row else b""
-        r.headers = json.loads(row[3]) if row else {}
+        try:
+            r.headers = json.loads(row[3]) if row else {}
+        except Exception:
+            r.headers = {}
         return r, bool(row)
     _update_last_hit(host)
     # 429 handling
@@ -285,48 +299,118 @@ def _jsonld_date_published(html: str):
     except: pass
     return None
 
-# pubtime JSON cache
+# Meta <meta property="article:published_time" content="..."> extraction
+_META_TAG_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\'](?:article:published_time|og:published_time)["\'][^>]*>',
+    re.I
+)
+_CONTENT_ATTR_RE = re.compile(r'\bcontent=["\']([^"\']+)["\']', re.I)
+
+def _meta_published_from_html(html: str):
+    """
+    Return the value of content=... from an appropriate meta tag, if present.
+    """
+    for tag in _META_TAG_RE.findall(html):
+        m = _CONTENT_ATTR_RE.search(tag)
+        if m:
+            return m.group(1).strip()
+    return None
+
+# pubtime JSON cache (guarded)
 CACHE_FILE = CACHE_DIR / "url_pubtime_cache.json"
 UTC = dttz.UTC
+_CACHE_LOCK = threading.RLock()
 _PAGE_FETCHES = 0
+_PAGE_FETCHES_LOCK = threading.RLock()
 CACHE_TTL_HOURS = 24
 
 def _load_cache(path: Path) -> dict:
-    if path.exists():
-        try: return json.load(open(path,"r",encoding="utf-8"))
-        except: return {}
-    return {}
+    with _CACHE_LOCK:
+        if path.exists():
+            try:
+                return json.load(open(path,"r",encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
 
-def _save_cache(path: Path,data: dict):
-    try: json.dump(data, open(path,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-    except: pass
+def _atomic_save_json(path: Path, data: dict):
+    # Write to a temp file then replace atomically to avoid truncated/corrupt files
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    os.close(tmp_fd)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        shutil.move(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+def _save_cache(path: Path, data: dict):
+    with _CACHE_LOCK:
+        try:
+            _atomic_save_json(path, data)
+        except Exception:
+            pass
 
 _PUBTIME_CACHE = _load_cache(CACHE_FILE)
 
 def fetch_page_published_time(url: str,fallback_tz):
     global _PAGE_FETCHES, _PUBTIME_CACHE
-    if not url: return None,"fetch_failed","error"
-    rec = _PUBTIME_CACHE.get(url)
-    if rec: return dtparser.parse(rec["published_utc"]),rec.get("source"),"cached"
-    if _PAGE_FETCHES>=300: return None,"fetch_failed","no_meta"
-    html,status=_http_get(url)
-    _PAGE_FETCHES+=1
-    if status!="ok" or not html: return None,"fetch_failed",status
-    # check meta tags
-    for pattern,label in [
-        (r'article:published_time','article:published_time'),
-        (r'og:published_time','og:published_time')
-    ]:
-        m=re.search(pattern,html,re.I)
-        if m:
-            dt=dtparser.parse(m.group(0))
-            return dt.astimezone(UTC),f"page_meta_{label}","ok"
-    # JSON-LD
-    raw=_jsonld_date_published(html)
+    if not url:
+        return None, "fetch_failed", "error"
+
+    # JSON cache hit
+    with _CACHE_LOCK:
+        rec = _PUBTIME_CACHE.get(url)
+    if rec:
+        try:
+            return dtparser.parse(rec["published_utc"]), rec.get("source"), "cached"
+        except Exception:
+            # bad cache entry — fall through to refetch
+            pass
+
+    # throttle hard cap
+    with _PAGE_FETCHES_LOCK:
+        if _PAGE_FETCHES >= 300:
+            return None, "fetch_failed", "no_meta"
+
+    html, status = _http_get(url)
+    with _PAGE_FETCHES_LOCK:
+        _PAGE_FETCHES += 1  # count an attempt regardless of code path
+
+    if status != "ok" or not html:
+        return None, "fetch_failed", status
+
+    # 1) meta tags
+    raw = _meta_published_from_html(html)
     if raw:
-        dt=dtparser.parse(raw)
-        return dt.astimezone(UTC),"json_ld","ok"
-    return None,"fetch_failed","no_meta"
+        try:
+            dt = dtparser.parse(raw)
+            dt_utc = dt.astimezone(UTC)
+            with _CACHE_LOCK:
+                _PUBTIME_CACHE[url] = {"published_utc": dt_utc.isoformat(), "source": "page_meta"}
+                _save_cache(CACHE_FILE, _PUBTIME_CACHE)
+            return dt_utc, "page_meta", "ok"
+        except Exception:
+            pass
+
+    # 2) JSON-LD
+    raw = _jsonld_date_published(html)
+    if raw:
+        try:
+            dt = dtparser.parse(raw)
+            dt_utc = dt.astimezone(UTC)
+            with _CACHE_LOCK:
+                _PUBTIME_CACHE[url] = {"published_utc": dt_utc.isoformat(), "source": "json_ld"}
+                _save_cache(CACHE_FILE, _PUBTIME_CACHE)
+            return dt_utc, "json_ld", "ok"
+        except Exception:
+            pass
+
+    return None, "fetch_failed", "no_meta"
 
 def _feed_fallback_tz(feed_cfg: dict):
     tz_name=feed_cfg.get("tz")
@@ -344,6 +428,9 @@ def parse_from_feed_fields(entry: dict,fallback_tz):
 def pick_summary(entry: dict) -> str:
     return entry.get("summary") or entry.get("description") or ""
 
+# A mutex to ensure only one fetch_headlines run at a time in this process
+_RUN_LOCK = threading.RLock()
+
 # ========== FETCH HEADLINES ==========
 def fetch_headlines(
     feeds,
@@ -353,98 +440,103 @@ def fetch_headlines(
     debug_article=False,
     debug_date_sources=True,
 ):
-    # normalize filters once
-    include_kw = [k.strip().lower() for k in (include_kw or []) if isinstance(k, str) and k.strip()]
-    exclude_kw = [k.strip().lower() for k in (exclude_kw or []) if isinstance(k, str) and k.strip()]
+    with _RUN_LOCK:
+        # soft-reset the per-process fetch counter for each user-triggered run
+        with _PAGE_FETCHES_LOCK:
+            _PAGE_FETCHES = 0  # reset count for this run
 
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(minutes=minutes_back)
-    rows = []
+        # normalize filters once
+        include_kw = [k.strip().lower() for k in (include_kw or []) if isinstance(k, str) and k.strip()]
+        exclude_kw = [k.strip().lower() for k in (exclude_kw or []) if isinstance(k, str) and k.strip()]
 
-    for feed in feeds:
-        url = feed.get("url")
-        if not url:
-            continue
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=minutes_back)
+        rows = []
 
-        # Expand {when} for Google News feeds
-        if "{when}" in url:
-            url = url.replace("{when}", google_news_when(minutes_back))
-
-        parsed = parse_feed_with_cache(url)
-        entries = getattr(parsed, "entries", []) or []
-        fallback_tz = _feed_fallback_tz(feed)
-        source_name = feed.get("name") or "unknown"
-        source_type = feed.get("source_type") or "rss"
-
-        for e in entries:
-            title = (e.get("title") or "").strip()
-            if not title:
-                continue
-            summary = pick_summary(e)
-            link = unwrap_google_news(e.get("link") or "")
-
-            # ---------- APPLY KEYWORD FILTERS ----------
-            blob = f"{title} {summary}".lower()
-            if include_kw and not any(k in blob for k in include_kw):
-                continue  # must match at least one include term
-            if exclude_kw and any(k in blob for k in exclude_kw):
-                continue  # drop if any exclude term matches
-            # ------------------------------------------
-
-            # 1) feed-provided publish time
-            published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
-
-            # 2) fallback to page metadata if needed
-            fetch_status = "ok"
-            if published_dt is None and link:
-                published_dt, ts_source, fetch_status = fetch_page_published_time(link, fallback_tz)
-
-            # 3) final fallback so it still appears
-            if published_dt is None:
-                published_dt = now_utc
-                ts_source = "fallback_now"
-                if fetch_status is None:
-                    fetch_status = "no_date_anywhere"
-
-            if published_dt < cutoff:
+        for feed in feeds:
+            url = feed.get("url")
+            if not url:
                 continue
 
-            rows.append({
-                "headline": title,
-                "summary": summary,
-                "source": source_name,
-                "link": link,
-                "source_type": source_type,
-                "published": published_dt.isoformat(),
-                "timestamp": now_utc.isoformat(),
-                "event_type": "",
-                "timestamp_source": ts_source,
-                "page_fetch_status": fetch_status or "ok",
-            })
+            # Expand {when} for Google News feeds
+            if "{when}" in url:
+                url = url.replace("{when}", google_news_when(minutes_back))
 
-    df = pd.DataFrame(rows, columns=[
-        "headline","summary","source","link","source_type",
-        "published","timestamp","event_type","timestamp_source","page_fetch_status"
-    ])
+            parsed = parse_feed_with_cache(url)
+            entries = getattr(parsed, "entries", []) or []
+            fallback_tz = _feed_fallback_tz(feed)
+            source_name = feed.get("name") or "unknown"
+            source_type = feed.get("source_type") or "rss"
 
-    if df.empty:
+            for e in entries:
+                title = (e.get("title") or "").strip()
+                if not title:
+                    continue
+                summary = pick_summary(e)
+                link = unwrap_google_news(e.get("link") or "")
+
+                # ---------- APPLY KEYWORD FILTERS ----------
+                blob = f"{title} {summary}".lower()
+                if include_kw and not any(k in blob for k in include_kw):
+                    continue  # must match at least one include term
+                if exclude_kw and any(k in blob for k in exclude_kw):
+                    continue  # drop if any exclude term matches
+                # ------------------------------------------
+
+                # 1) feed-provided publish time
+                published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
+
+                # 2) fallback to page metadata if needed
+                fetch_status = "ok"
+                if published_dt is None and link:
+                    published_dt, ts_source, fetch_status = fetch_page_published_time(link, fallback_tz)
+
+                # 3) final fallback so it still appears
+                if published_dt is None:
+                    published_dt = now_utc
+                    ts_source = "fallback_now"
+                    if fetch_status is None:
+                        fetch_status = "no_date_anywhere"
+
+                if published_dt < cutoff:
+                    continue
+
+                rows.append({
+                    "headline": title,
+                    "summary": summary,
+                    "source": source_name,
+                    "link": link,
+                    "source_type": source_type,
+                    "published": published_dt.isoformat(),
+                    "timestamp": now_utc.isoformat(),
+                    "event_type": "",
+                    "timestamp_source": ts_source,
+                    "page_fetch_status": fetch_status or "ok",
+                })
+
+        df = pd.DataFrame(rows, columns=[
+            "headline","summary","source","link","source_type",
+            "published","timestamp","event_type","timestamp_source","page_fetch_status"
+        ])
+
+        if df.empty:
+            return df
+
+        # De-dup + newest-first
+        def _to_dt_or_min(x):
+            try:
+                return dtparser.parse(x) if x else datetime(1970,1,1, tzinfo=timezone.utc)
+            except Exception:
+                return datetime(1970,1,1, tzinfo=timezone.utc)
+
+        df = df.drop_duplicates(subset=["headline","link"]).reset_index(drop=True)
+        df["_sort_pub"] = df["published"].apply(_to_dt_or_min)
+        df["_sort_ts"] = df["timestamp"].apply(_to_dt_or_min)
+        df = df.sort_values(by=["_sort_pub","_sort_ts"], ascending=False)\
+               .drop(columns=["_sort_pub","_sort_ts"])\
+               .reset_index(drop=True)
+
         return df
-
-    # De-dup + newest-first
-    def _to_dt_or_min(x):
-        try:
-            return dtparser.parse(x) if x else datetime(1970,1,1, tzinfo=timezone.utc)
-        except Exception:
-            return datetime(1970,1,1, tzinfo=timezone.utc)
-
-    df = df.drop_duplicates(subset=["headline","link"]).reset_index(drop=True)
-    df["_sort_pub"] = df["published"].apply(_to_dt_or_min)
-    df["_sort_ts"] = df["timestamp"].apply(_to_dt_or_min)
-    df = df.sort_values(by=["_sort_pub","_sort_ts"], ascending=False)\
-           .drop(columns=["_sort_pub","_sort_ts"])\
-           .reset_index(drop=True)
-
-    return df
 
 # ========== LOCALIZE + EXCEL ==========
 def _iso_to_local_str(iso_utc: str,display_tz_name: str,style: str="human") -> str:
