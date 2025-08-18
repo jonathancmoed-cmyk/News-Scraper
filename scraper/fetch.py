@@ -1,6 +1,6 @@
 import os, json, time, re, random, base64, tempfile, shutil
 from pathlib import Path
-from urllib.parse import urlparse, parse_qsl
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 import threading
 
@@ -26,38 +26,14 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
-def google_news_when(minutes_back: int) -> str:
-    if minutes_back <= 60:      return "1h"
-    if minutes_back <= 180:     return "3h"
-    if minutes_back <= 360:     return "6h"
-    if minutes_back <= 720:     return "12h"
-    if minutes_back <= 1440:    return "1d"
-    if minutes_back <= 2880:    return "2d"
-    if minutes_back <= 10080:   return "1w"
-    return "1m"
-
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=6, connect=3, read=3,
         backoff_factor=1.2,
-        status_forcelist=(429,500,502,503,504),
-        allowed_methods=("GET","HEAD","OPTIONS"),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://",  HTTPAdapter(max_retries=retry))
-    return s
-
-def make_light_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(DEFAULT_HEADERS)
-    retry = Retry(
-        total=1, connect=1, read=1,
-        backoff_factor=0.3,
-        status_forcelist=(429,500,502,503,504),
-        allowed_methods=("GET","HEAD","OPTIONS"),
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD", "OPTIONS"),
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -65,11 +41,11 @@ def make_light_session() -> requests.Session:
     return s
 
 SESSION = make_session()
-SESSION_RSSHUB = make_light_session()
 
 # polite wait + cooldown (guard with locks)
 _last_hit = {}
-MIN_GAP = {"rsshub.app":5.0,"apnews.com":2.0,"www.theguardian.com":0.6}
+# Removed rsshub-specific gaps
+MIN_GAP = {"apnews.com": 2.0, "www.theguardian.com": 0.6}
 DEFAULT_GAP = 0.8
 _HOST_COOLDOWN_UNTIL = {}
 _NET_LOCK = threading.RLock()
@@ -144,9 +120,7 @@ def _set_cached_record(url: str, status: int, content_bytes: bytes, headers: dic
 # load once at import
 _HTTP_CACHE = _load_http_cache(HTTP_CACHE_FILE)
 
-# --- cache pruning settings + helper ---
 # Keep HTTP cache entries for this many seconds (default 7 days).
-# You can override via environment variable: NEWS_HTTP_CACHE_MAX_AGE=259200  (3 days)
 HTTP_CACHE_MAX_AGE = int(os.getenv("NEWS_HTTP_CACHE_MAX_AGE", str(7 * 86400)))
 
 def _prune_http_cache(now: float | None = None):
@@ -160,8 +134,6 @@ def _prune_http_cache(now: float | None = None):
         for u in stale_urls:
             _HTTP_CACHE.pop(u, None)
         _atomic_save_json(HTTP_CACHE_FILE, _HTTP_CACHE)
-# --- end pruning helper ---
-
 
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
     """
@@ -203,17 +175,15 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
     # polite wait
     _polite_wait(host)
 
-    # session
-    sess = SESSION_RSSHUB if host == "rsshub.app" else SESSION
-    timeout = timeout_override if timeout_override is not None else (8 if host == "rsshub.app" else 15)
+    # single session (rsshub removed)
+    sess = SESSION
+    timeout = timeout_override if timeout_override is not None else 15
     merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
 
     # perform request with retry and capture response
     try:
         resp = sess.get(url, timeout=timeout, headers=merged_headers)
     except requests.RequestException:
-        if host == "rsshub.app":
-            _set_cooldown(host, 180)
         # synthesize a response from stale cache if any
         class Resp: pass
         r = Resp()
@@ -243,13 +213,11 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         try:
             resp = sess.get(url, timeout=timeout, headers=merged_headers)
         except requests.RequestException:
-            if host == "rsshub.app":
-                _set_cooldown(host, 180)
             return None, False
         _update_last_hit(host)
 
-    # cooldown for flaky hosts
-    if resp.status_code in (500, 502, 503, 504) and host == "rsshub.app":
+    # cooldown for flaky hosts (generic now)
+    if resp.status_code in (500, 502, 503, 504):
         _set_cooldown(host, 180)
 
     # persist cache
@@ -260,64 +228,51 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         dict(getattr(resp, "headers", {}))
     )
 
-    # probabilistic prune (~10%) to limit disk writes while preventing bloat
+    # probabilistic prune (~10%)
     if random.random() < 0.10:
         _prune_http_cache(now)
 
     return resp, False
 
 # ========== FEED + PAGE HELPERS ==========
-def unwrap_google_news(url: str) -> str:
-    try:
-        p = urlparse(url or "")
-        if p.netloc in ("news.google.com","news.googleusercontent.com"):
-            qs = dict(parse_qsl(p.query))
-            if "url" in qs: return qs["url"]
-    except: pass
-    return url or ""
-
-def _is_yahoo_finance(url: str) -> bool:
-    try:
-        host = urlparse(url).netloc.lower()
-        return host.endswith("finance.yahoo.com") or host.endswith("yahoo.com")
-    except Exception:
-        return False
-
 def parse_feed_with_cache(feed_url: str, ttl_seconds: int = 300):
-    resp,_ = fetch_cached(feed_url, max_age_seconds=ttl_seconds, headers=DEFAULT_HEADERS)
-    if not resp or getattr(resp,"status_code",0)!=200:
+    resp, _ = fetch_cached(feed_url, max_age_seconds=ttl_seconds, headers=DEFAULT_HEADERS)
+    if not resp or getattr(resp, "status_code", 0) != 200:
         return feedparser.parse(b"")
     return feedparser.parse(resp.content)
 
-def fetch_article_with_cache(url: str, ttl_seconds: int = 6*3600):
-    resp,_ = fetch_cached(url, max_age_seconds=ttl_seconds, headers=DEFAULT_HEADERS, timeout_override=5)
+def fetch_article_with_cache(url: str, ttl_seconds: int = 6 * 3600):
+    resp, _ = fetch_cached(url, max_age_seconds=ttl_seconds, headers=DEFAULT_HEADERS, timeout_override=5)
     return resp
 
 def _http_get(url: str):
-    resp = fetch_article_with_cache(url, ttl_seconds=6*3600)
-    code = getattr(resp,"status_code",0) or 0
-    if code==200:
-        try: return resp.content.decode("utf-8","ignore"), "ok"
-        except: return None,"error"
-    if code==403: return None,"http403"
-    if code==429: return None,"http429"
-    if 400<=code<500: return None,"http4xx"
-    if 500<=code<600: return None,"http5xx"
-    return None,"error"
+    resp = fetch_article_with_cache(url, ttl_seconds=6 * 3600)
+    code = getattr(resp, "status_code", 0) or 0
+    if code == 200:
+        try:
+            return resp.content.decode("utf-8", "ignore"), "ok"
+        except:
+            return None, "error"
+    if code == 403: return None, "http403"
+    if code == 429: return None, "http429"
+    if 400 <= code < 500: return None, "http4xx"
+    if 500 <= code < 600: return None, "http5xx"
+    return None, "error"
 
 # JSON-LD regex
-_JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I|re.DOTALL)
+_JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.I | re.DOTALL)
 
 def _jsonld_date_published(html: str):
     try:
         for m in _JSONLD_RE.finditer(html):
             data = json.loads(m.group(1))
-            items = data if isinstance(data,list) else [data]
+            items = data if isinstance(data, list) else [data]
             for obj in items:
-                if isinstance(obj,dict):
-                    if isinstance(obj.get("datePublished"),str):
+                if isinstance(obj, dict):
+                    if isinstance(obj.get("datePublished"), str):
                         return obj["datePublished"].strip()
-    except: pass
+    except:
+        pass
     return None
 
 # Meta <meta property="article:published_time" content="..."> extraction
@@ -349,7 +304,7 @@ def _load_cache(path: Path) -> dict:
     with _CACHE_LOCK:
         if path.exists():
             try:
-                return json.load(open(path,"r",encoding="utf-8"))
+                return json.load(open(path, "r", encoding="utf-8"))
             except Exception:
                 return {}
         return {}
@@ -377,7 +332,7 @@ def _save_cache(path: Path, data: dict):
 
 _PUBTIME_CACHE = _load_cache(CACHE_FILE)
 
-def fetch_page_published_time(url: str,fallback_tz):
+def fetch_page_published_time(url: str, fallback_tz):
     global _PAGE_FETCHES, _PUBTIME_CACHE
     if not url:
         return None, "fetch_failed", "error"
@@ -432,20 +387,29 @@ def fetch_page_published_time(url: str,fallback_tz):
     return None, "fetch_failed", "no_meta"
 
 def _feed_fallback_tz(feed_cfg: dict):
-    tz_name=feed_cfg.get("tz")
+    tz_name = feed_cfg.get("tz")
     return dttz.gettz(tz_name) or UTC
 
-def parse_from_feed_fields(entry: dict,fallback_tz):
-    for key in ("published","pubDate","issued"):
-        raw=entry.get(key)
+def parse_from_feed_fields(entry: dict, fallback_tz):
+    for key in ("published", "pubDate", "issued"):
+        raw = entry.get(key)
         if raw:
-            dt=dtparser.parse(raw)
-            if dt.tzinfo is None: dt=dt.replace(tzinfo=fallback_tz)
-            return dt.astimezone(UTC),key
-    return None,None
+            dt = dtparser.parse(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=fallback_tz)
+            return dt.astimezone(UTC), key
+    return None, None
 
 def pick_summary(entry: dict) -> str:
     return entry.get("summary") or entry.get("description") or ""
+
+# Utils for Yahoo-only filtering
+def _is_yahoo_finance_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host == "finance.yahoo.com" or host.endswith(".finance.yahoo.com")
 
 # A mutex to ensure only one fetch_headlines run at a time in this process
 _RUN_LOCK = threading.RLock()
@@ -477,9 +441,7 @@ def fetch_headlines(
             if not url:
                 continue
 
-            # Expand {when} for Google News feeds
-            if "{when}" in url:
-                url = url.replace("{when}", google_news_when(minutes_back))
+            # (Removed Google News {when} expansion)
 
             parsed = parse_feed_with_cache(url)
             entries = getattr(parsed, "entries", []) or []
@@ -492,7 +454,7 @@ def fetch_headlines(
                 if not title:
                     continue
                 summary = pick_summary(e)
-                link = unwrap_google_news(e.get("link") or "")
+                link = e.get("link") or ""
 
                 # ---------- APPLY KEYWORD FILTERS ----------
                 blob = f"{title} {summary}".lower()
@@ -502,62 +464,58 @@ def fetch_headlines(
                     continue  # drop if any exclude term matches
                 # ------------------------------------------
 
-                # ---------- YAHOO-ONLY FILTER ----------
-                if feed.get("only_yahoo") and link:
-                    if not _is_yahoo_finance(link):
-                        continue  # skip this item
-                # ---------------------------------------
-
+                # ---------- YAHOO-ONLY FILTER (per-feed) ----------
+                # Add to feed in YAML: only_yahoo: true
+                if feed.get("only_yahoo"):
+                    if not _is_yahoo_finance_url(link):
+                        # e.g., https://www.thestreet.com/...?.tsrc=rss -> drop
+                        continue
+                # --------------------------------------------------
 
                 # --- TIMESTAMP PICKING (per-feed control) ---
-                
-                # 1) feed-provided publish time
                 published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
                 fetch_status = "ok"
-                
+
                 # EARLY CUTOFF: if feed gave a time and it's older than the window, skip now (no page fetch)
                 if published_dt is not None and published_dt < cutoff:
                     continue
-                
+
                 # Read per-feed policy from feeds.yaml (valid: "off", "missing_only", "prefer")
                 page_time_mode = (feed.get("page_time_mode") or "off").lower()
-                
+
                 # 2) Page "published" time according to mode
                 if link:
                     if page_time_mode == "prefer":
-                        # Fetch page time and prefer it if it's earlier (e.g., CNBC/BBC)
                         page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
                         if page_pub_dt and ((published_dt is None) or (page_pub_dt < published_dt - timedelta(seconds=30))):
                             published_dt = page_pub_dt
                             ts_source = page_src or "page_meta"
                             fetch_status = page_status or "ok"
-                
+
                     elif page_time_mode == "missing_only":
-                        # Only fetch page time if the feed had no time
                         if published_dt is None:
                             page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
                             if page_pub_dt:
                                 published_dt = page_pub_dt
                                 ts_source = page_src or "page_meta"
                                 fetch_status = page_status or "ok"
-                
+
                     else:
                         # "off" -> trust the feed time; do nothing
                         pass
-                
+
                 # 3) Final fallback so it still appears
                 if published_dt is None:
                     published_dt = now_utc
                     ts_source = "fallback_now"
                     if fetch_status is None:
                         fetch_status = "no_date_anywhere"
-                
+
                 # Re-check cutoff after any fallback/page fetch
                 if published_dt < cutoff:
                     continue
 
                 # --- END TIMESTAMP PICKING ---
-
 
                 rows.append({
                     "headline": title,
@@ -583,41 +541,42 @@ def fetch_headlines(
         # De-dup + newest-first
         def _to_dt_or_min(x):
             try:
-                return dtparser.parse(x) if x else datetime(1970,1,1, tzinfo=timezone.utc)
+                return dtparser.parse(x) if x else datetime(1970, 1, 1, tzinfo=timezone.utc)
             except Exception:
-                return datetime(1970,1,1, tzinfo=timezone.utc)
+                return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-        df = df.drop_duplicates(subset=["headline","link"]).reset_index(drop=True)
+        df = df.drop_duplicates(subset=["headline", "link"]).reset_index(drop=True)
         df["_sort_pub"] = df["published"].apply(_to_dt_or_min)
         df["_sort_ts"] = df["timestamp"].apply(_to_dt_or_min)
-        df = df.sort_values(by=["_sort_pub","_sort_ts"], ascending=False)\
-               .drop(columns=["_sort_pub","_sort_ts"])\
+        df = df.sort_values(by=["_sort_pub", "_sort_ts"], ascending=False)\
+               .drop(columns=["_sort_pub", "_sort_ts"])\
                .reset_index(drop=True)
 
         return df
 
 # ========== LOCALIZE + EXCEL ==========
-def _iso_to_local_str(iso_utc: str,display_tz_name: str,style: str="human") -> str:
+def _iso_to_local_str(iso_utc: str, display_tz_name: str, style: str = "human") -> str:
     try:
-        display_tz=dttz.gettz(display_tz_name) or dttz.UTC
-        dt_utc=dtparser.parse(iso_utc)
-        dt_loc=dt_utc.astimezone(display_tz)
+        display_tz = dttz.gettz(display_tz_name) or dttz.UTC
+        dt_utc = dtparser.parse(iso_utc)
+        dt_loc = dt_utc.astimezone(display_tz)
         return dt_loc.strftime("%Y-%m-%d %H:%M:%S %Z")
-    except: return iso_utc
+    except:
+        return iso_utc
 
-def localize_df_for_display(df_utc: pd.DataFrame,display_tz_name: str,style="human"):
-    xdf=df_utc.copy()
-    for col in ("published","timestamp"):
+def localize_df_for_display(df_utc: pd.DataFrame, display_tz_name: str, style="human"):
+    xdf = df_utc.copy()
+    for col in ("published", "timestamp"):
         if col in xdf.columns:
-            xdf[col]=xdf[col].apply(lambda s:_iso_to_local_str(s,display_tz_name,style))
+            xdf[col] = xdf[col].apply(lambda s: _iso_to_local_str(s, display_tz_name, style))
     return xdf
 
-def save_excel(df_utc: pd.DataFrame,out_dir: Path,display_tz_name: str) -> Path:
-    from openpyxl import Workbook
-    xdf=localize_df_for_display(df_utc,display_tz_name)
-    display_tz=dttz.gettz(display_tz_name) or dttz.UTC
-    local_now=datetime.now(timezone.utc).astimezone(display_tz)
-    out_path=out_dir/f"headlines_{local_now.strftime('%Y%m%d_%H%M')}.xlsx"
-    with pd.ExcelWriter(out_path,engine="openpyxl") as w:
-        xdf.to_excel(w,index=False,sheet_name="Headlines")
+def save_excel(df_utc: pd.DataFrame, out_dir: Path, display_tz_name: str) -> Path:
+    from openpyxl import Workbook  # noqa: F401
+    xdf = localize_df_for_display(df_utc, display_tz_name)
+    display_tz = dttz.gettz(display_tz_name) or dttz.UTC
+    local_now = datetime.now(timezone.utc).astimezone(display_tz)
+    out_path = out_dir / f"headlines_{local_now.strftime('%Y%m%d_%H%M')}.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        xdf.to_excel(w, index=False, sheet_name="Headlines")
     return out_path
