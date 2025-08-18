@@ -495,35 +495,55 @@ def fetch_headlines(
                     continue  # drop if any exclude term matches
                 # ------------------------------------------
 
+                # --- TIMESTAMP PICKING (per-feed control) ---
+                
                 # 1) feed-provided publish time
                 published_dt, ts_source = parse_from_feed_fields(e, fallback_tz)
-                
-                # 2) also try page "published" time (meta/JSON-LD)
-                page_pub_dt = None
-                page_src = None
-                page_status = None
                 fetch_status = "ok"
                 
+                # EARLY CUTOFF: if feed gave a time and it's older than the window, skip now (no page fetch)
+                if published_dt is not None and published_dt < cutoff:
+                    continue
+                
+                # Read per-feed policy from feeds.yaml (valid: "off", "missing_only", "prefer")
+                page_time_mode = (feed.get("page_time_mode") or "off").lower()
+                
+                # 2) Page "published" time according to mode
                 if link:
-                    page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
+                    if page_time_mode == "prefer":
+                        # Fetch page time and prefer it if it's earlier (e.g., CNBC/BBC)
+                        page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
+                        if page_pub_dt and ((published_dt is None) or (page_pub_dt < published_dt - timedelta(seconds=30))):
+                            published_dt = page_pub_dt
+                            ts_source = page_src or "page_meta"
+                            fetch_status = page_status or "ok"
                 
-                # Decision: prefer the page "published" time when it exists and is earlier
-                # (CNBC and others put "updated" in feed pubDate; the page has the true original publish)
-                if page_pub_dt:
-                    if (published_dt is None) or (page_pub_dt < published_dt - timedelta(seconds=30)):
-                        published_dt = page_pub_dt
-                        ts_source = page_src or "page_meta"
-                        fetch_status = page_status or "ok"
+                    elif page_time_mode == "missing_only":
+                        # Only fetch page time if the feed had no time
+                        if published_dt is None:
+                            page_pub_dt, page_src, page_status = fetch_page_published_time(link, fallback_tz)
+                            if page_pub_dt:
+                                published_dt = page_pub_dt
+                                ts_source = page_src or "page_meta"
+                                fetch_status = page_status or "ok"
                 
-                # 3) final fallback so it still appears
+                    else:
+                        # "off" -> trust the feed time; do nothing
+                        pass
+                
+                # 3) Final fallback so it still appears
                 if published_dt is None:
                     published_dt = now_utc
                     ts_source = "fallback_now"
                     if fetch_status is None:
                         fetch_status = "no_date_anywhere"
-
+                
+                # Re-check cutoff after any fallback/page fetch
                 if published_dt < cutoff:
                     continue
+
+                # --- END TIMESTAMP PICKING ---
+
 
                 rows.append({
                     "headline": title,
