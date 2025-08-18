@@ -276,6 +276,13 @@ def unwrap_google_news(url: str) -> str:
     except: pass
     return url or ""
 
+def _is_yahoo_finance(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+        return host.endswith("finance.yahoo.com") or host.endswith("yahoo.com")
+    except Exception:
+        return False
+
 def parse_feed_with_cache(feed_url: str, ttl_seconds: int = 300):
     resp,_ = fetch_cached(feed_url, max_age_seconds=ttl_seconds, headers=DEFAULT_HEADERS)
     if not resp or getattr(resp,"status_code",0)!=200:
@@ -494,6 +501,13 @@ def fetch_headlines(
                 if exclude_kw and any(k in blob for k in exclude_kw):
                     continue  # drop if any exclude term matches
                 # ------------------------------------------
+
+                # ---------- YAHOO-ONLY FILTER ----------
+                if feed.get("only_yahoo") and link:
+                    if not _is_yahoo_finance(link):
+                        continue  # skip this item
+                # ---------------------------------------
+
 
                 # --- TIMESTAMP PICKING (per-feed control) ---
                 
