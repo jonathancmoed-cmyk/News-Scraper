@@ -6,7 +6,7 @@ feeds:
     url: https://www.theguardian.com/uk/business/rss
     tz: Europe/London
   - name: Guardian World
-    url: https://www.theguardian.com/world/rss
+    url: https://www.theguardia.com/world/rss
     tz: Europe/London
   - name: Guardian Politics
     url: https://www.theguardian.com/politics/rss
