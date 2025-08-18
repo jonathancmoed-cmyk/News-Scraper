@@ -118,7 +118,7 @@ def _init_cache_db_once():
         conn = sqlite3.connect(
             db_uri,
             uri=True,
-            check_same_thread=False,
+            check_same_thread=True,
             timeout=30,
             isolation_level=None,     # autocommit
         )
@@ -143,7 +143,7 @@ def _db_select_one(query: str, params: tuple):
         conn = sqlite3.connect(
             db_uri,
             uri=True,
-            check_same_thread=False,
+            check_same_thread=True,
             timeout=30,
             isolation_level=None,
         )
@@ -162,7 +162,7 @@ def _db_execute(query: str, params: tuple):
         conn = sqlite3.connect(
             db_uri,
             uri=True,
-            check_same_thread=False,
+            check_same_thread=True,
             timeout=30,
             isolation_level=None,
         )
