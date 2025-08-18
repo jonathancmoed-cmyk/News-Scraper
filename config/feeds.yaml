@@ -30,11 +30,11 @@ feeds:
   - name: BBC Business
     url: https://feeds.bbci.co.uk/news/business/rss.xml
     tz: Europe/London
-    page_time_mode: off  
+    page_time_mode: prefer
   - name: BBC World
     url: https://feeds.bbci.co.uk/news/world/rss.xml
     tz: Europe/London
-    page_time_mode: off 
+    page_time_mode: prefer 
   - name: BBC Politics
     url: https://feeds.bbci.co.uk/news/politics/rss.xml
     tz: Europe/London
