@@ -144,6 +144,25 @@ def _set_cached_record(url: str, status: int, content_bytes: bytes, headers: dic
 # load once at import
 _HTTP_CACHE = _load_http_cache(HTTP_CACHE_FILE)
 
+# --- cache pruning settings + helper ---
+# Keep HTTP cache entries for this many seconds (default 7 days).
+# You can override via environment variable: NEWS_HTTP_CACHE_MAX_AGE=259200  (3 days)
+HTTP_CACHE_MAX_AGE = int(os.getenv("NEWS_HTTP_CACHE_MAX_AGE", str(7 * 86400)))
+
+def _prune_http_cache(now: float | None = None):
+    """Remove HTTP cache entries older than HTTP_CACHE_MAX_AGE, then save atomically."""
+    now = now or time.time()
+    with _HTTP_CACHE_LOCK:
+        stale_urls = [u for u, rec in _HTTP_CACHE.items()
+                      if now - rec.get("fetched_at", 0) > HTTP_CACHE_MAX_AGE]
+        if not stale_urls:
+            return
+        for u in stale_urls:
+            _HTTP_CACHE.pop(u, None)
+        _atomic_save_json(HTTP_CACHE_FILE, _HTTP_CACHE)
+# --- end pruning helper ---
+
+
 def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = None, timeout_override: int | None = None):
     """
     Cache layer backed by a JSON file. Thread-safe via locks + atomic writes.
@@ -240,6 +259,11 @@ def fetch_cached(url: str, max_age_seconds: int = 180, headers: dict | None = No
         getattr(resp, "content", b""),
         dict(getattr(resp, "headers", {}))
     )
+
+    # probabilistic prune (~10%) to limit disk writes while preventing bloat
+    if random.random() < 0.10:
+        _prune_http_cache(now)
+
     return resp, False
 
 # ========== FEED + PAGE HELPERS ==========
