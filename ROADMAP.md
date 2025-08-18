@@ -13,6 +13,7 @@ This doc tracks planned updates, tweaks, and shipped work. Use checkboxes for st
 ## 🔜 Next Up (1–2 weeks)
 - [ ] Feed diagnostics panel (to check whether there are bad feeds in the .yaml)
 - [ ] Sidebar: slider/env var for HTTP cache retention (`NEWS_HTTP_CACHE_MAX_AGE`)
+- [ ] clean up the summary sections
 - [ ] Archive: create a single Excel file containing all the articles/URLs (without duplicates) that the scraper has ever pulled
       Continuously update as the scraper runs
       [ask burgess what information is needed in that excel] 
