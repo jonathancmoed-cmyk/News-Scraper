@@ -1,39 +1,61 @@
-import os, sys
+import os, sys, time, hashlib, json
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-import time
 from io import BytesIO
-
 import pandas as pd
 import streamlit as st
 
 from scraper.config import load_feeds, CACHE_DIR
 from scraper.fetch import fetch_headlines, localize_df_for_display
 
-# DEBUG: show which fetch module is loaded + confirm backend
-import inspect
-import scraper.fetch as fetch
-
-st.sidebar.caption(f"Loaded fetch module: `{fetch.__file__}`")
-src = inspect.getsource(fetch)
-uses_sqlite = "sqlite3" in src or "url_cache.sqlite" in src
-st.sidebar.caption(f"fetch backend: {'SQLITE' if uses_sqlite else 'JSON'}")
-
+# -----------------------------------------------------------------------------
+# App config
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="News Scraper", layout="wide")
 st.title("News Scraper")
 
+# -----------------------------------------------------------------------------
+# Cache wrapper (Streamlit cache: keeps final DataFrame for fast reruns)
+# -----------------------------------------------------------------------------
+CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
-# ---- Helpers ----
+def _params_key(feeds, include_kw, exclude_kw, minutes_back) -> str:
+    """Stable hash key; cache invalidates when inputs change."""
+    payload = {
+        "feeds": [
+            {k: v for k, v in f.items()
+             if k in ("name", "url", "tz", "page_time_mode", "only_yahoo")}
+            for f in feeds
+        ],
+        "include_kw": include_kw or [],
+        "exclude_kw": exclude_kw or [],
+        "minutes_back": int(minutes_back),
+        "logic_version": 1,  # bump if you change business logic
+    }
+    s = json.dumps(payload, sort_keys=True)
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_headlines_cached(_cache_key: str, feeds, include_kw, exclude_kw, minutes_back: int) -> pd.DataFrame:
+    """Cached wrapper around fetch_headlines."""
+    return fetch_headlines(
+        feeds=feeds,
+        include_kw=include_kw,
+        exclude_kw=exclude_kw,
+        minutes_back=minutes_back,
+    )
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def _split_csv(text: str):
     return [s.strip() for s in text.split(",") if s.strip()] if text else []
-
 
 def _ensure_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in cols:
         if c not in df.columns:
             df[c] = ""
     return df
-
 
 def _fmt_bytes(n: int | None) -> str:
     if n is None:
@@ -44,15 +66,15 @@ def _fmt_bytes(n: int | None) -> str:
         n /= 1024
     return f"{n:.1f} TB"
 
-
 def _file_size(path) -> int | None:
     try:
         return os.path.getsize(path)
     except Exception:
         return None
 
-
-# --- Sidebar controls ---
+# -----------------------------------------------------------------------------
+# Sidebar controls
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Filters")
     include_kw_text = st.text_input("Include keywords (comma-separated)", "")
@@ -62,7 +84,12 @@ with st.sidebar:
         min_value=10, max_value=10080, value=1440, step=10
     )
     display_tz = st.text_input("Display timezone", "Europe/Amsterdam")
-    run_btn = st.button("Run scraper")
+
+    col_btn = st.columns(2)
+    with col_btn[0]:
+        run_btn = st.button("Run scraper")
+    with col_btn[1]:
+        force_refresh = st.button("🔄 Force refresh")
 
     st.markdown("---")
     st.header("Maintenance")
@@ -106,8 +133,14 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to delete pubtime cache: {e}")
 
+# If user clicks Force refresh, clear Streamlit's results cache
+if force_refresh:
+    st.cache_data.clear()
+    st.toast("Cache cleared – next run will refetch.", icon="🧹")
 
-# --- Main action ---
+# -----------------------------------------------------------------------------
+# Main action
+# -----------------------------------------------------------------------------
 if run_btn:
     with st.spinner("Fetching headlines..."):
         feeds = load_feeds()
@@ -115,12 +148,8 @@ if run_btn:
         exclude_kw = _split_csv(exclude_kw_text)
 
         t0 = time.time()
-        df = fetch_headlines(
-            feeds,
-            include_kw=include_kw,
-            exclude_kw=exclude_kw,
-            minutes_back=int(minutes_back),
-        )
+        cache_key = _params_key(feeds, include_kw, exclude_kw, int(minutes_back))
+        df = fetch_headlines_cached(cache_key, feeds, include_kw, exclude_kw, int(minutes_back))
         runtime = time.time() - t0
 
     st.success(f"Collected **{len(df)}** rows in **{runtime:.2f}s**.")
