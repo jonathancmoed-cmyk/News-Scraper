@@ -116,4 +116,26 @@ feeds:
     page_time_mode: off 
     only_yahoo: true 
 
+  # ==== Index Feeds ====
+  - name: Yahoo Finance NASDAQ Composite
+    url: https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EIXIC&region=US&lang=en-US
+    tz: America/New_York
+    page_time_mode: off
+    only_yahoo: true
+
+  - name: Yahoo Finance NYSE Composite
+    url: https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5ENYA&region=US&lang=en-US
+    tz: America/New_York
+    page_time_mode: off
+    only_yahoo: true
+
+  - name: Yahoo Finance AEX Index
+    url: https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EAEX&region=US&lang=en-US
+    tz: Europe/Amsterdam
+    page_time_mode: off
+    only_yahoo: true
+
+ 
+  
+
 
