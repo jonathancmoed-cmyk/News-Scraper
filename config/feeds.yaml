@@ -110,7 +110,7 @@ feeds:
   
   
   # ==== Ticker specific feeds ==== 
-  - name: Yahoo Finance AAPL
+  - #name: Yahoo Finance AAPL
     url: https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US
     tz: America/New_York
     page_time_mode: off 
